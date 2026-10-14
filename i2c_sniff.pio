@@ -1,0 +1,8 @@
+.program i2c_sniff
+; GP8 = SDA (bit 0), GP9 = SCL (bit 1).
+; Continuous 2-bit samples, 16 per RX FIFO word.
+.wrap_target
+sample_loop:
+    in pins, 2
+    jmp sample_loop
+.wrap

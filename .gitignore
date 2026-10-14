@@ -1,0 +1,7 @@
+build/
+Firmware_Backups/
+.vscode/
+*.uf2
+*.elf
+*.bin
+

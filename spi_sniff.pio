@@ -1,0 +1,7 @@
+; Passive SPI sampler. Capture all 32 GPIO levels in each 32-bit FIFO word.
+; CS GP26 is not adjacent to GP20..22, hence MOV ISR,PINS.
+.program spi_sniff
+.wrap_target
+    mov isr, pins
+    push block
+.wrap

@@ -31,8 +31,9 @@
 // Must run before CYW43, USB, SPI, I2C and PIO initialization.
 #define SOH_EXPERIMENTAL_200MHZ 0
 
-#define SOH_LED_PIN PICO_DEFAULT_LED_PIN  // Pico 2 onboard LED (GPIO25)
-#define FW_VERSION "PICO2-R1-PORT"
+#include "pico/cyw43_arch.h"
+#define SOH_LED_PIN CYW43_WL_GPIO_LED_PIN  // Pico 2 W onboard LED via CYW43
+#define FW_VERSION "PICO2W-R1-PORT"
 
 #define SDA_PIN 4
 
@@ -154,6 +155,14 @@ static void spi_trace_off(void) {
 }
 static void spi_sniff_stop(void);
 static volatile bool spi_sniff_active;
+// SLA stream is opt-in; legacy SPI SNIFF diagnostics remain unchanged.
+static bool spi_sla_stream = false;
+static volatile uint64_t spi_sla_frame_start_us = 0;
+static volatile uint64_t spi_sla_ready_start_us = 0;
+static volatile uint64_t spi_sla_ready_end_us = 0;
+static volatile uint32_t spi_sla_capture_id = 0;
+static volatile uint32_t spi_sla_packet_id = 0;
+
 static void spi_trace_arm(void) {
     if (spi_sniff_active) spi_sniff_stop();
     spi_trace_off();
@@ -171,7 +180,7 @@ static void spi_trace_arm(void) {
     const uint32_t mask = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
     // R10: the PIO sniffer may leave GP26 muxed to PIO1 after STOP.
     // Return it to SIO input for GPIO IRQ-based CS tracing.
-    // SPI SNIFF START will restore the PIO function when needed.
+    // SPI NEW CAPTURE restores the PIO function when needed.
     gpio_set_function(26, GPIO_FUNC_SIO);
     gpio_set_dir(26, GPIO_IN);
     gpio_disable_pulls(26);
@@ -541,49 +550,111 @@ static void sniff_sample(uint8_t pins) {
     sniff_prev = pins;
     sniff_prev_valid = true;
 }
-// R24: transition-compressed I2C capture. Store only level changes with
-// sample-clock timestamps, allowing long idle gaps without consuming RAM.
-// Finish after the configured number of STOP conditions (repeated START does not count).
+// R25: continuous I2C transaction streaming. Capture and USB transmission are
+// decoupled: the DMA consumer only enqueues complete transactions.
 #define LOGIC_MAX_EDGES 16384u
-typedef struct { uint32_t tick; uint8_t pins; } logic_edge_t;
-static logic_edge_t logic_edges[LOGIC_MAX_EDGES];
-static uint32_t logic_ticks, logic_edge_count, logic_stops;
-static uint32_t logic_stop_target = 2u;
-static bool logic_overflow;
+#define LOGIC_PACKET_EDGES 512u
+// R5.3: 24 * ~8 KiB = ~192 KiB of static outgoing packet storage.
+// Avoid 64 slots: that alone would exceed the RP2350's 520 KiB SRAM.
+#define LOGIC_PACKET_SLOTS 24u
+typedef struct { uint64_t tick; uint8_t pins; } logic_edge_t;
+typedef struct {
+    uint32_t packet_id, count;
+    logic_edge_t edges[LOGIC_PACKET_EDGES];
+} logic_packet_t;
+static logic_packet_t logic_packets[LOGIC_PACKET_SLOTS];
+static uint64_t logic_ticks;
+static uint32_t logic_edge_count, logic_stops;
+static uint32_t logic_packet_number, logic_dropped_packets;
+static uint32_t logic_queue_head, logic_queue_tail, logic_queue_count;
+static uint32_t logic_queue_high_water, logic_queue_full_drops, logic_edge_limit_drops;
+static uint32_t logic_usb_sent;
+static uint32_t logic_tx_index;
+static bool logic_overflow, logic_packet_open, logic_packet_discard;
+static uint8_t logic_tx_phase;
 static void logic_record_buffer(uint32_t index) {
-    if (!logic_armed || logic_ready) return;
+    if (!logic_armed) return;
     for (uint32_t i = 0; i < SNIFF_BLOCK_WORDS; ++i) {
         uint32_t word = sniff_buffers[index][i];
         for (int shift = 30; shift >= 0; shift -= 2) {
             uint8_t sample = (uint8_t)((word >> shift) & 3u);
             uint8_t previous = logic_previous;
             logic_previous = sample;
-            if (!logic_triggered) {
+            // Timestamp advances even in idle time; the PC can measure real gaps.
+            ++logic_ticks;
+            if (!logic_packet_open) {
                 if (previous == 3u && sample == 2u) {
                     logic_triggered = true;
-                    logic_ticks = 1u;
+                    logic_packet_open = true;
+                    logic_packet_discard = false;
                     logic_edge_count = 0;
-                    logic_edges[logic_edge_count++] = (logic_edge_t){0u, 3u};
-                    logic_edges[logic_edge_count++] = (logic_edge_t){1u, 2u};
+                    if (logic_queue_count == LOGIC_PACKET_SLOTS) {
+                        logic_packet_discard = true;
+                        ++logic_dropped_packets;
+                        ++logic_queue_full_drops;
+                    } else {
+                        logic_packet_t *p = &logic_packets[logic_queue_head];
+                        p->edges[logic_edge_count++] = (logic_edge_t){logic_ticks - 1u, 3u};
+                        p->edges[logic_edge_count++] = (logic_edge_t){logic_ticks, 2u};
+                    }
                 }
                 continue;
             }
-            ++logic_ticks;
             if (previous == sample) continue;
-            if (logic_edge_count == LOGIC_MAX_EDGES) {
-                logic_overflow = true;
-                logic_ready = true;
-                logic_armed = false;
-                return;
+            if (!logic_packet_discard) {
+                if (logic_edge_count >= LOGIC_PACKET_EDGES) {
+                    logic_packet_discard = true;
+                    logic_overflow = true;
+                    ++logic_dropped_packets;
+                    ++logic_edge_limit_drops;
+                } else {
+                    logic_packets[logic_queue_head].edges[logic_edge_count++] =
+                        (logic_edge_t){logic_ticks, sample};
+                }
             }
-            logic_edges[logic_edge_count++] = (logic_edge_t){logic_ticks, sample};
-            // STOP: SDA rises while SCL stays high.
-            if (previous == 2u && sample == 3u && ++logic_stops >= logic_stop_target) {
-                logic_ready = true;
-                logic_armed = false;
-                return;
+            // STOP: SDA rises with SCL high; repeated START remains in packet.
+            if (previous == 2u && sample == 3u) {
+                ++logic_stops;
+                ++logic_packet_number;
+                if (!logic_packet_discard) {
+                    logic_packet_t *p = &logic_packets[logic_queue_head];
+                    p->packet_id = logic_packet_number;
+                    p->count = logic_edge_count;
+                    logic_queue_head = (logic_queue_head + 1u) % LOGIC_PACKET_SLOTS;
+                    ++logic_queue_count;
+                    if (logic_queue_count > logic_queue_high_water)
+                        logic_queue_high_water = logic_queue_count;
+                }
+                logic_packet_open = false;
+                logic_edge_count = 0;
             }
         }
+    }
+}
+// One USB line per foreground iteration: do not block DMA processing for
+// an entire transaction. A slow host may still cause queue overruns.
+static void logic_stream_step(void) {
+    if (logic_queue_count == 0u) return;
+    logic_packet_t *p = &logic_packets[logic_queue_tail];
+    if (logic_tx_phase == 0u) {
+        printf("LOGIC_BEGIN I2C ID=%lu PACKET=%lu FIRST=%u SAMPLE_HZ=%lu COUNT=%lu FORMAT=EDGE_TICKS\n",
+               (unsigned long)logic_capture_id, (unsigned long)p->packet_id,
+               p->packet_id == 1u ? 1u : 0u, (unsigned long)LOGIC_SAMPLE_HZ,
+               (unsigned long)p->count);
+        logic_tx_index = 0;
+        logic_tx_phase = 1;
+    } else if (logic_tx_phase == 1u) {
+        logic_edge_t e = p->edges[logic_tx_index++];
+        printf("LOGIC_EDGE %llu,%u\n", (unsigned long long)e.tick, (unsigned)e.pins);
+        if (logic_tx_index == p->count) logic_tx_phase = 2;
+    } else {
+        printf("LOGIC_END ID=%lu PACKET=%lu COUNT=%lu STOPS=1 OVERFLOW=0\n",
+               (unsigned long)logic_capture_id, (unsigned long)p->packet_id,
+               (unsigned long)p->count);
+        logic_queue_tail = (logic_queue_tail + 1u) % LOGIC_PACKET_SLOTS;
+        --logic_queue_count;
+        ++logic_usb_sent;
+        logic_tx_phase = 0;
     }
 }
 static void sniff_decode_buffer(uint32_t index) {
@@ -856,7 +927,7 @@ static void soh_led_update(void) {
     uint64_t now = to_ms_since_boot(get_absolute_time());
     if (soh_led_ready && now >= soh_led_next_ms) {
         soh_led_state = !soh_led_state;
-        gpio_put(SOH_LED_PIN, soh_led_state);
+        cyw43_arch_gpio_put(SOH_LED_PIN, soh_led_state);
         soh_led_next_ms = now + 500;
     }
 }
@@ -869,7 +940,7 @@ static void soh_led_update(void) {
 // CPU reconstructs edges after CS rises. No per-clock IRQs.
 #define SPI_SNIFF_RAW_WORDS 16384u
 static volatile bool spi_sniff_active;
-static bool spi_sniff_decode = true;
+
 static volatile uint32_t spi_sniff_frames, spi_sniff_partial, spi_sniff_overruns;
 static volatile uint32_t spi_sniff_cs_fall, spi_sniff_cs_rise;
 static volatile uint32_t spi_sniff_words_last, spi_sniff_suppressed;
@@ -906,6 +977,7 @@ static void spi_sniff_gpio_irq(uint gpio, uint32_t events) {
     if (!spi_sniff_active || gpio != 26) return;
     if (events & GPIO_IRQ_EDGE_FALL) {
         ++spi_sniff_cs_fall;
+        spi_sla_frame_start_us = time_us_64();
         spi_sniff_in_frame = true;
     }
     if (events & GPIO_IRQ_EDGE_RISE) {
@@ -933,6 +1005,8 @@ static void spi_sniff_gpio_irq(uint gpio, uint32_t events) {
         if (spi_sniff_ready) ++spi_sniff_overruns;
         else {
             spi_sniff_ready_words = n;
+            spi_sla_ready_start_us = spi_sla_frame_start_us;
+            spi_sla_ready_end_us = time_us_64();
             __compiler_memory_barrier();
             spi_sniff_ready = true;
         }
@@ -973,20 +1047,29 @@ static void spi_sniff_update(void) {
     spi_sniff_partial=bits&7u;
     bool raw_full=(words>=SPI_SNIFF_RAW_WORDS);
     if(raw_full) ++spi_sniff_full_frames;
-    if (spi_sniff_decode) {
-        printf("SPI_SNIFF: MOSI=");
-        for(uint32_t i=0;i<bytes;++i) printf("%s%02X",i?" ":"",mosi[i]);
-        printf(" MISO=");
-        for(uint32_t i=0;i<bytes;++i) printf("%s%02X",i?" ":"",miso[i]);
-        if(spi_sniff_partial) printf(" PARTIAL_BITS=%lu",(unsigned long)spi_sniff_partial);
-        if(raw_full) printf(" RAW_BUFFER_FULL FRAME_TRUNCATED");
-        printf(" RAW_WORDS=%lu/%lu DECODED_BYTES=%lu DMA_AT_RISE=%lu FIFO_AT_RISE=%lu RXSTALL=%lu DMA_BUSY=%lu",(unsigned long)words,
-               (unsigned long)SPI_SNIFF_RAW_WORDS,(unsigned long)bytes,
-               (unsigned long)spi_sniff_raw_words_at_rise_last,
-               (unsigned long)spi_sniff_fifo_level_last,
-               (unsigned long)spi_sniff_fifo_overflow_last,
-               (unsigned long)spi_sniff_dma_busy_last);
-        puts("");
+    if (spi_sla_stream) {
+        // ASCII wire protocol v1. Each RAW line contains 10 three-bit samples
+        // per 32-bit word, earliest sample in bits 29:27.
+        // Do not rearm until the complete frame has been emitted.
+        uint32_t packet = ++spi_sla_packet_id;
+        printf("SLA_BEGIN ID=%lu PACKET=%lu START_US=%llu END_US=%llu MODE=%lu WORDS=%lu SAMPLE_HZ=%lu PARTIAL_BITS=%lu TRUNCATED=%u\n",
+            (unsigned long)spi_sla_capture_id, (unsigned long)packet,
+            (unsigned long long)spi_sla_ready_start_us,
+            (unsigned long long)spi_sla_ready_end_us,
+            (unsigned long)spi_sniff_program_mode, (unsigned long)words,
+            (unsigned long)clock_get_hz(clk_sys), (unsigned long)spi_sniff_partial,
+            (unsigned)(raw_full ? 1 : 0));
+        for (uint32_t i = 0; i < words; i += 16u) {
+            uint32_t count = words - i;
+            if (count > 16u) count = 16u;
+            printf("SLA_RAW %lu", (unsigned long)i);
+            for (uint32_t j = 0; j < count; ++j)
+                printf(" %08lX", (unsigned long)spi_sniff_buffer[i + j]);
+            puts("");
+        }
+        printf("SLA_END ID=%lu PACKET=%lu WORDS=%lu\n",
+            (unsigned long)spi_sla_capture_id, (unsigned long)packet,
+            (unsigned long)words);
     } else ++spi_sniff_suppressed;
     spi_sniff_ready=false;
     if(spi_sniff_active && !spi_sniff_in_frame && gpio_get(26)) spi_sniff_rearm();
@@ -1040,53 +1123,22 @@ static void spi_sniff_stop(void) {
     pio_sm_unclaim(spi_sniff_pio,spi_sniff_sm);
     pio_remove_program(spi_sniff_pio,&spi_sniff_raw_program,spi_sniff_offset);
     spi_sniff_update();
-    printf("OK SPI_SNIFF=STOPPED FRAMES=%lu CS_FALL=%lu CS_RISE=%lu RAW_WORDS_LAST=%lu OVERRUNS=%lu\n",
+    printf("OK SPI CAPTURE ENGINE STOPPED FRAMES=%lu CS_FALL=%lu CS_RISE=%lu RAW_WORDS_LAST=%lu OVERRUNS=%lu\n",
         (unsigned long)spi_sniff_frames,(unsigned long)spi_sniff_cs_fall,
         (unsigned long)spi_sniff_cs_rise,(unsigned long)spi_sniff_words_last,
         (unsigned long)spi_sniff_overruns);
 }
-static void spi_sniff_command(char **ctx) {
-    char *op=token(ctx);
-    if(!op){puts("ERR SPI SNIFF expected START|STOP|STATUS|DECODE");return;}
-    for(char *p=op;*p;++p)*p=(char)toupper((unsigned char)*p);
-    if(!strcmp(op,"START")) {
-        spi_sniff_decode=true;spi_sniff_start();
-        puts("OK SPI_SNIFF=RUNNING DECODE=ON CAPTURE=PIO_RAW_DMA");
-    } else if(!strcmp(op,"STOP")) {
-        if(spi_sniff_active)spi_sniff_stop();else puts("OK SPI_SNIFF=STOPPED");
-    } else if(!strcmp(op,"STATUS")) {
-        printf("OK SPI_SNIFF=%s DECODE=%s CAPTURE=PIO_RAW_DMA MODE=%lu FRAMES=%lu CS_FALL=%lu CS_RISE=%lu RAW_WORDS_LAST=%lu RAW_CAPACITY=%lu RAW_FULL_FRAMES=%lu DECODED_BYTES_LAST=%lu PARTIAL_BITS=%lu OVERRUNS=%lu DMA_AT_RISE=%lu DMA_REMAINING_AT_RISE=%lu FIFO_AT_RISE=%lu RXSTALL=%lu DMA_BUSY=%lu GP20=%u GP21=%u GP22=%u GP26=%u\n",
-            spi_sniff_active?"RUNNING":"STOPPED",spi_sniff_decode?"ON":"OFF",
-            (unsigned long)spi_sniff_program_mode,(unsigned long)spi_sniff_frames,
-            (unsigned long)spi_sniff_cs_fall,(unsigned long)spi_sniff_cs_rise,
-            (unsigned long)spi_sniff_words_last,(unsigned long)SPI_SNIFF_RAW_WORDS,
-            (unsigned long)spi_sniff_full_frames,
-            (unsigned long)spi_sniff_decoded_bytes_last,(unsigned long)spi_sniff_partial,
-            (unsigned long)spi_sniff_overruns,
-            (unsigned long)spi_sniff_raw_words_at_rise_last,
-            (unsigned long)spi_sniff_dma_remaining_last,
-            (unsigned long)spi_sniff_fifo_level_last,
-            (unsigned long)spi_sniff_fifo_overflow_last,
-            (unsigned long)spi_sniff_dma_busy_last,
-            gpio_get(20),gpio_get(21),gpio_get(22),gpio_get(26));
-    } else if(!strcmp(op,"DECODE")) {
-        char *v=token(ctx);
-        if(!v||token(ctx)){puts("ERR SPI SNIFF DECODE ON|OFF");return;}
-        for(char *p=v;*p;++p)*p=(char)toupper((unsigned char)*p);
-        if(!strcmp(v,"ON"))spi_sniff_decode=true;
-        else if(!strcmp(v,"OFF"))spi_sniff_decode=false;
-        else {puts("ERR SPI SNIFF DECODE ON|OFF");return;}
-        printf("OK SPI SNIFF DECODE=%s\n",spi_sniff_decode?"ON":"OFF");
-    } else puts("ERR SPI SNIFF expected START|STOP|STATUS|DECODE");
-}
-
 static void spi_command(char **ctx) {
     char *op = token(ctx);
-    if (!op) { puts("ERR SPI expected STATUS|MODE|SPEED|SLAVE|CS|TRACE|XFER|SNIFF"); return; }
+    if (!op) { puts("ERR SPI expected STATUS|MODE|SPEED|SLAVE|CS|TRACE|XFER"); return; }
     for (char *p=op; *p; ++p) *p=(char)toupper((unsigned char)*p);
     if (!strcmp(op,"STATUS")) {
         printf("OK SPI0=MASTER SPI1=SLAVE MODE=%lu BAUD=%lu SLAVE_TX_LEN=%lu SLAVE_RX_COUNT=%lu SNIFFER=%s\n",
             (unsigned long)spi_mode,(unsigned long)spi_baud,(unsigned long)spi_fixed_len,(unsigned long)spi_slave_rx_count,spi_sniff_active ? "RUNNING" : "STOPPED");
+        printf("SPI_CAPTURE ID=%lu STATE=%s PACKETS=%lu OVERRUNS=%lu PARTIAL_BITS=%lu RAW_WORDS_LAST=%lu\n",
+            (unsigned long)spi_sla_capture_id,spi_sniff_active?"STREAMING":"STOPPED",
+            (unsigned long)spi_sla_packet_id,(unsigned long)spi_sniff_overruns,
+            (unsigned long)spi_sniff_partial,(unsigned long)spi_sniff_words_last);
         spi_hw_t *shw = spi_get_hw(spi1);
         printf("SPI_HW: SSE=%u MS=%u SR=0x%02lX DMA_TX=%lu DMA_RX=%lu DMA_XFERS=%lu DMA_FAIL=%lu RX_OVERRUN=%lu\n",
             !!(shw->cr1 & SPI_SSPCR1_SSE_BITS),
@@ -1104,8 +1156,6 @@ static void spi_command(char **ctx) {
         else if (!strcmp(sub,"STATUS")) spi_trace_status();
         else if (!strcmp(sub,"DATA")) spi_trace_data();
         else puts("ERR SPI TRACE ARM|STATUS|DATA|OFF");
-    } else if (!strcmp(op,"SNIFF")) {
-        spi_sniff_command(ctx);
     } else if (!strcmp(op,"MODE?")) {
         if (token(ctx)) { puts("ERR ARGS"); return; }
         printf("OK SPI MODE=%lu\n", (unsigned long)spi_mode);
@@ -1203,7 +1253,34 @@ static void handle(char *line) {
     for (char *p=cmd; *p; ++p) *p=(char)toupper((unsigned char)*p);
 
     if (!strcmp(cmd,"SPI")) {
-        spi_command(&ctx);
+        // Probe a separate buffer: token() replaces delimiters with NUL.
+        // Never tokenize ctx before handing it to spi_command(), or commands
+        // such as SPI XFER and SPI SLAVE TX lose their arguments.
+        char probe_buffer[64];
+        snprintf(probe_buffer, sizeof(probe_buffer), "%s", ctx);
+        char *probe = probe_buffer;
+        char *action = token(&probe);
+        if (action) for(char *p=action;*p;++p)*p=(char)toupper((unsigned char)*p);
+        if (action && !strcmp(action,"NEW")) {
+            char *next=token(&probe);
+            if (next) for(char *p=next;*p;++p)*p=(char)toupper((unsigned char)*p);
+            if (!next || strcmp(next,"CAPTURE") || token(&probe)) {
+                puts("ERR SPI expected NEW CAPTURE"); return;
+            }
+            if (spi_sniff_active) spi_sniff_stop();
+            spi_sla_stream=true;
+            ++spi_sla_capture_id;
+            spi_sla_packet_id=0;
+            spi_sniff_start();
+            printf("OK SPI CAPTURE STARTED ID=%lu MODE=STREAM SAMPLE_HZ=%lu PINS=20,21,22,26\n",
+                (unsigned long)spi_sla_capture_id,(unsigned long)clock_get_hz(clk_sys));
+        } else if (action && !strcmp(action,"STOP") && !token(&probe)) {
+            if (spi_sla_stream && spi_sniff_active) spi_sniff_stop();
+            spi_sla_stream=false;
+            printf("OK SPI CAPTURE STOPPED ID=%lu PACKETS=%lu OVERRUNS=%lu\n",
+                (unsigned long)spi_sla_capture_id,(unsigned long)spi_sla_packet_id,
+                (unsigned long)spi_sniff_overruns);
+        } else spi_command(&ctx);
     } else if (!strcmp(cmd,"HELP")) {
 
         puts("GENERAL: HELP, INFO, LEDSTATUS, LEDTEST");
@@ -1214,6 +1291,7 @@ static void handle(char *line) {
         puts("  LOOP <addr> <reg> <read_count> <iterations> <delay_ms>");
         puts("  WRITE <addr> <byte>... | READ <addr> <count>");
         puts("  WRITEREAD <addr> <txcount> <txbytes...> <rxcount>");
+        puts("I2C LOGIC CAPTURE: I2C NEW CAPTURE | I2C STOP | I2C STATUS");
         puts("I2C SNIFFER:");
         puts("  SNIFF START | SNIFF STOP | SNIFF STATUS");
         puts("  SNIFF DECODE ON|OFF (START auto-enables decode)");
@@ -1225,101 +1303,73 @@ static void handle(char *line) {
         puts("  SPI XFER <byte>...");
         puts("  SPI CS PULSE XFER <1..8 bytes> (for CPHA=0 multi-byte slave transfers)");
         puts("  SPI TRACE ARM | SPI TRACE STATUS | SPI TRACE DATA | SPI TRACE OFF");
-        puts("SPI SNIFFER:");
-        puts("  SPI SNIFF START | SPI SNIFF STOP | SPI SNIFF STATUS");
-        puts("  SPI SNIFF DECODE ON|OFF (START auto-enables decode)");
+        puts("SPI LOGIC CAPTURE: SPI NEW CAPTURE | SPI STOP | SPI STATUS");
+        puts("  SPI XFER operates independently of capture and the SLA GUI");
         puts("Numbers: decimal or 0x-prefixed hex. I2C address is 7-bit. Max 128 data bytes.");
 
     } else if (!strcmp(cmd,"LEDSTATUS")) {
-        printf("OK FW=%s LED=GPIO25 TIMER=%s STATE=%s\r\n",
+        printf("OK FW=%s LED=CYW43 TIMER=%s STATE=%s\r\n",
                FW_VERSION, soh_led_ready ? "RUNNING" : "FAILED",
                soh_led_state ? "ON" : "OFF");
     } else if (!strcmp(cmd,"LEDTEST")) {
         for (int i = 0; i < 5; ++i) {
-            gpio_put(SOH_LED_PIN, true);
+            cyw43_arch_gpio_put(SOH_LED_PIN, true);
             sleep_ms(150);
-            gpio_put(SOH_LED_PIN, false);
+            cyw43_arch_gpio_put(SOH_LED_PIN, false);
             sleep_ms(150);
         }
         soh_led_state = false;
         soh_led_next_ms = to_ms_since_boot(get_absolute_time()) + 500;
         printf("OK LEDTEST FW=%s\r\n", FW_VERSION);
     } else if (!strcmp(cmd,"INFO")) {
-        printf("OK PICO_WH FW=%s LED=GPIO25 STATUS=%s\r\n",
+        printf("OK PICO2W FW=%s LED=CYW43 STATUS=%s\r\n",
                FW_VERSION, soh_led_ready ? "RUNNING" : "FAILED");
         printf("I2C0=MASTER SDA=GP4 SCL=GP5 SPEED=%lu\r\n", (unsigned long)bus_hz);
         printf("I2C1=SLAVE SDA=GP6 SCL=GP7 ADDR=0x%02X\r\n", test_slave_addr);
         printf("I2C_SNIFF SDA=GP8 SCL=GP9 MODE=PIO_DMA_DECODE\r\n");
         printf("SPI0=MASTER MISO=GP16 CS=GP17 SCK=GP18 MOSI=GP19 SPEED=%lu MODE=%lu\r\n", (unsigned long)spi_baud, (unsigned long)spi_mode);
         printf("SPI1=SLAVE MOSI=GP12 CS=GP13 SCK=GP14 MISO=GP15 MODE=%lu\r\n", (unsigned long)spi_mode);
-        printf("SPI_SNIFF=PIO_DMA MOSI=GP20 MISO=GP21 SCK=GP22 CS=GP26\r\n");
-    } else if (!strcmp(cmd,"LOGIC")) {
-        char *bus = token(&ctx), *action = token(&ctx);
-        if (!bus || !action || strcmp(bus, "I2C")) {
-            puts("ERR LOGIC expected I2C ARM|STATUS|READ|STOP"); return;
-        }
+        printf("SPI_CAPTURE=PIO_DMA MOSI=GP20 MISO=GP21 SCK=GP22 CS=GP26\r\n");
+    } else if (!strcmp(cmd,"I2C")) {
+        char *action = token(&ctx);
+        if (!action) { puts("ERR I2C expected NEW CAPTURE|STOP|STATUS"); return; }
         for (char *q=action; *q; ++q) *q=(char)toupper((unsigned char)*q);
-        if (!strcmp(action,"ARM")) {
-            char *count_arg = token(&ctx);
-            uint32_t requested_stops = 2u;
-            if (count_arg) {
-                char *end = NULL;
-                unsigned long parsed = strtoul(count_arg, &end, 10);
-                if (!count_arg[0] || !end || *end != '\0' || parsed < 1ul || parsed > 10ul) {
-                    puts("ERR LOGIC I2C ARM count must be 1..10");
-                    return;
-                }
-                requested_stops = (uint32_t)parsed;
+        if (!strcmp(action,"NEW")) {
+            char *next = token(&ctx);
+            if (!next) { puts("ERR I2C expected NEW CAPTURE"); return; }
+            for (char *q=next; *q; ++q) *q=(char)toupper((unsigned char)*q);
+            if (strcmp(next,"CAPTURE") || token(&ctx)) {
+                puts("ERR I2C expected NEW CAPTURE"); return;
             }
             if (sniff_active) sniff_stop();
-            logic_stop_target = requested_stops;
             logic_previous = 3u; logic_ready = logic_triggered = false;
-            logic_ticks = logic_edge_count = logic_stops = 0; logic_overflow = false;
+            logic_ticks = logic_edge_count = logic_stops = 0;
+            logic_packet_number = logic_dropped_packets = 0;
+            logic_queue_head = logic_queue_tail = logic_queue_count = 0;
+            logic_queue_high_water = logic_queue_full_drops = logic_edge_limit_drops = 0;
+            logic_usb_sent = 0;
+            logic_tx_index = 0; logic_tx_phase = 0;
+            logic_packet_open = logic_packet_discard = logic_overflow = false;
             logic_armed = true; ++logic_capture_id;
             sniff_decode = false;
             sniff_start();
-            printf("OK LOGIC I2C ARMED ID=%lu SAMPLE_HZ=%lu CAPACITY=%lu TARGET_STOPS=%lu\n",
+            printf("OK I2C CAPTURE STARTED ID=%lu MODE=STREAM SAMPLE_HZ=%lu QUEUE=%lu\n",
                    (unsigned long)logic_capture_id, (unsigned long)LOGIC_SAMPLE_HZ,
-                   (unsigned long)LOGIC_MAX_EDGES, (unsigned long)logic_stop_target);
-        } else if (!strcmp(action,"STATUS")) {
-            printf("OK LOGIC I2C ID=%lu STATE=%s TRIGGERED=%u SAMPLES=%lu SAMPLE_HZ=%lu GAPS=%lu OVERRUNS=%lu STOPS=%lu TARGET_STOPS=%lu\n",
-                   (unsigned long)logic_capture_id,
-                   logic_ready ? "READY" : logic_armed ? "ARMED" : "IDLE",
-                   logic_triggered ? 1u : 0u, (unsigned long)logic_edge_count,
+                   (unsigned long)LOGIC_PACKET_SLOTS);
+        } else if (!strcmp(action,"STATUS") && !token(&ctx)) {
+            printf("OK I2C ID=%lu STATE=%s TRIGGERED=%u PACKETS=%lu QUEUED=%lu DROPPED=%lu SAMPLE_HZ=%lu GAPS=%lu OVERRUNS=%lu STOPS=%lu\n",
+                   (unsigned long)logic_capture_id, logic_armed ? "STREAMING" : "STOPPED",
+                   logic_triggered ? 1u : 0u, (unsigned long)logic_packet_number,
+                   (unsigned long)logic_queue_count, (unsigned long)logic_dropped_packets,
                    (unsigned long)LOGIC_SAMPLE_HZ, (unsigned long)sniff_gaps,
-                   (unsigned long)sniff_overruns, (unsigned long)logic_stops,
-                   (unsigned long)logic_stop_target);
-        } else if (!strcmp(action,"READ")) {
-            // TARGET_STOPS is an automatic completion limit, not a READ prerequisite.
-            // Finalize only after a complete I2C transaction (at least one STOP).
-            // Stop PIO/DMA before streaming so the edge array remains immutable.
-            if (!logic_ready) {
-                sniff_drain();
-                if (!logic_triggered || logic_stops == 0u) {
-                    puts("ERR LOGIC I2C NOT_READY"); return;
-                }
-                logic_armed = false;
-                logic_ready = true;
-            }
-            if (sniff_active) sniff_stop();
-            // Text-framed hex protocol avoids raw bytes colliding with CDC log lines.
-            // FC must validate ID, length and the END line before accepting a capture.
-            printf("LOGIC_BEGIN I2C ID=%lu SAMPLE_HZ=%lu COUNT=%lu FORMAT=EDGE_TICKS\n",
-                   (unsigned long)logic_capture_id, (unsigned long)LOGIC_SAMPLE_HZ,
-                   (unsigned long)logic_edge_count);
-            for (uint32_t i=0; i<logic_edge_count; ++i)
-                printf("LOGIC_EDGE %lu,%u\n", (unsigned long)logic_edges[i].tick,
-                       (unsigned)logic_edges[i].pins);
-            printf("LOGIC_END ID=%lu COUNT=%lu STOPS=%lu OVERFLOW=%u\n",
-                   (unsigned long)logic_capture_id, (unsigned long)logic_edge_count,
-                   (unsigned long)logic_stops, logic_overflow ? 1u : 0u);
-        } else if (!strcmp(action,"STOP")) {
+                   (unsigned long)sniff_overruns, (unsigned long)logic_stops);
+        } else if (!strcmp(action,"STOP") && !token(&ctx)) {
             logic_armed = false;
             if (sniff_active) sniff_stop();
-            printf("OK LOGIC I2C STOPPED ID=%lu READY=%u SAMPLES=%lu\n",
-                   (unsigned long)logic_capture_id, logic_ready ? 1u : 0u,
-                   (unsigned long)logic_edge_count);
-        } else puts("ERR LOGIC expected I2C ARM|STATUS|READ|STOP");
+            printf("OK I2C CAPTURE STOPPED ID=%lu PACKETS=%lu DROPPED=%lu\n",
+                   (unsigned long)logic_capture_id, (unsigned long)logic_packet_number,
+                   (unsigned long)logic_dropped_packets);
+        } else puts("ERR I2C expected NEW CAPTURE|STOP|STATUS");
     } else if (!strcmp(cmd,"SNIFF")) {
         char *arg = token(&ctx);
         if (!arg) { puts("ERR SNIFF expected START|STOP|STATUS|DECODE"); return; }
@@ -1577,14 +1627,8 @@ int main(void) {
         // The serial startup banner below reports the actual frequency.
     }
 #endif
-    // Pico 2 non-wireless board: LED is directly connected to GPIO25.
-    gpio_init(SOH_LED_PIN);
-    gpio_set_dir(SOH_LED_PIN, GPIO_OUT);
-    soh_led_ready = true;
-    if (soh_led_ready) {
-        gpio_put(SOH_LED_PIN, false);
-        soh_led_next_ms = to_ms_since_boot(get_absolute_time()) + 500;
-    }
+    // Pico 2 W onboard LED is controlled through the CYW43 wireless chip.
+    // Initialize after stdio_init_all() below.
 
 #if SOH_EXPERIMENTAL_200MHZ
     // On this board clk_peri remained at 48 MHz after changing clk_sys.
@@ -1597,6 +1641,11 @@ int main(void) {
 #endif
 
     stdio_init_all();
+    soh_led_ready = (cyw43_arch_init() == 0);
+    if (soh_led_ready) {
+        cyw43_arch_gpio_put(SOH_LED_PIN, false);
+        soh_led_next_ms = to_ms_since_boot(get_absolute_time()) + 500;
+    }
 
     // Wait briefly for a USB CDC terminal so the startup message is visible.
     // Continue after 5 seconds even if no terminal is connected.
@@ -1604,8 +1653,8 @@ int main(void) {
     while (!stdio_usb_connected() && !time_reached(deadline)) {
         sleep_ms(10);
     }
-    printf("Pico 2 RP2350 I2C Controller Ready\r\n");
-    printf("FW=%s SOH LED GPIO25: %s\r\n", FW_VERSION, soh_led_ready ? "1 Hz heartbeat" : "INIT ERROR");
+    printf("Pico 2 W RP2350 I2C Controller Ready\r\n");
+    printf("FW=%s SOH LED CYW43: %s\r\n", FW_VERSION, soh_led_ready ? "1 Hz heartbeat" : "INIT ERROR");
     printf("CLOCK SYS=%lu Hz PERI=%lu Hz %s\r\n",
         (unsigned long)clock_get_hz(clk_sys),
         (unsigned long)clock_get_hz(clk_peri),
@@ -1639,8 +1688,11 @@ int main(void) {
     while (true) {
         soh_led_update();
         sniff_drain();
+        logic_stream_step();
         spi_sniff_update();
-        int c=getchar_timeout_us(1000);
+        // R5.3: Do not idle for up to 1 ms on every pass. USB packet
+        // transmission is serviced on each foreground iteration.
+        int c=getchar_timeout_us(0);
 
         if (c==PICO_ERROR_TIMEOUT) continue;
 

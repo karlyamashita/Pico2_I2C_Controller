@@ -298,9 +298,9 @@ static void spi_dma_transfer(const uint8_t *tx, uint8_t *rx, uint32_t n) {
     while ((hw->sr & SPI_SSPSR_TFE_BITS) && !time_reached(prime_deadline)) tight_loop_contents();
 
     gpio_put(SPI_MASTER_CS, false);
-    busy_wait_us_32(10);
+    busy_wait_us_32(1);  // CS setup: 1 us (was 10 us).
     int result = spi_write_read_blocking(spi0, tx, rx, n);
-    busy_wait_us_32(10);
+    busy_wait_us_32(1);  // CS hold: 1 us (was 10 us).
     gpio_put(SPI_MASTER_CS, true);
 
     // Wait briefly for the final SPI1 RX DMA request to be serviced.
